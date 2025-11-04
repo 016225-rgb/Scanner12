@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+  <title>Escáner QR - Móvil</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#06b6d4;--muted:#94a3b8;--glass: rgba(255,255,255,0.03);}    
+    html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;color:#e6eef6;background:linear-gradient(180deg,var(--bg),#061223);}
+    .app{min-height:100%;display:flex;flex-direction:column;gap:12px;padding:18px;box-sizing:border-box}
+    header{display:flex;flex-direction:row;align-items:center;justify-content:space-between}
+    h1{font-size:20px;margin:0}
+    p.lead{margin:2px 0 0;color:var(--muted);font-size:13px}
+
+    .card{background:var(--card);border-radius:14px;padding:12px;box-shadow:0 6px 20px rgba(2,6,23,0.6);}
+
+    .viewer{position:relative;border-radius:12px;overflow:hidden;height:52vh;max-height:640px;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent)}
+    video{width:100%;height:100%;object-fit:cover}
+    canvas{display:none}
+
+    /* overlay crosshair */
+    .overlay{position:absolute;inset:0;pointer-events:none;display:flex;align-items:center;justify-content:center}
+    .frame{width:78%;aspect-ratio:1/1;border-radius:8px;border:3px dashed rgba(255,255,255,0.08);box-shadow:0 8px 40px rgba(2,6,23,0.7), inset 0 0 40px rgba(0,0,0,0.3)}
+    .corner{position:absolute;width:22px;height:22px;border:3px solid var(--accent);border-radius:6px;opacity:0.9}
+
+    .controls{display:flex;gap:8px;margin-top:10px}
+    button{background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent);border:1px solid rgba(255,255,255,0.06);padding:10px 12px;border-radius:10px;color:inherit;font-weight:600}
+    button.primary{background:linear-gradient(180deg,var(--accent),#02869a);color:#042027;border:none}
+
+    .info{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+    .result{padding:10px;border-radius:8px;background:var(--glass);font-size:14px;color:var(--accent);word-break:break-all}
+    .muted{color:var(--muted);font-size:13px}
+
+    footer{margin-top:auto;text-align:center;color:var(--muted);font-size:12px}
+
+    /* responsive tweaks */
+    @media (max-width:420px){h1{font-size:18px}.viewer{height:56vh}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>Bienvenidos</h1>
+        <p class="lead">Escanear tabla nutricional del producto con la cámara</p>
+      </div>
+      <div class="muted">Modo móvil</div>
+    </header>
+
+    <div class="card">
+      <div class="viewer" id="viewer">
+        <video id="video" playsinline></video>
+        <canvas id="canvas"></canvas>
+        <div class="overlay">
+          <div class="frame" aria-hidden="true"></div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn" class="primary">Iniciar cámara</button>
+        <button id="stopBtn">Detener</button>
+        <button id="torchBtn">Encender linterna</button>
+      </div>
+
+      <div class="info">
+        <div class="muted">Resultado del escaneo:</div>
+        <div id="result" class="result">- ningún código detectado -</div>
+        <div id="log" class="muted"></div>
+      </div>
+    </div>
+
+    <footer>Hecho para escanear códigos QR en celular • Compatible con la mayoría de navegadores móviles modernos</footer>
+  </div>
+
+  <!-- Fallback QR library: jsQR (se usa si BarcodeDetector no está disponible) -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const resultEl = document.getElementById('result');
+    const logEl = document.getElementById('log');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const torchBtn = document.getElementById('torchBtn');
+
+    let stream = null;
+    let scanning = false;
+    let useTorch = false;
+    let track = null;
+    let detectInterval = null;
+
+    async function startCamera(){
+      try{
+        stopCamera();
+        const constraints = { video: { facingMode: { ideal: 'environment' } }, audio:false };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        await video.play();
+        track = stream.getVideoTracks()[0] || null;
+        log('Cámara iniciada: ' + (track ? track.label : 'sin label'));
+
+        // prepare canvas size same as video
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+
+        scanning = true;
+        detectLoop();
+      }catch(err){
+        log('Error al acceder a la cámara: ' + err.message);
+        resultEl.textContent = 'Error: permiso denegado o cámara no disponible';
+      }
+    }
+
+    function stopCamera(){
+      scanning = false;
+      if(detectInterval) { clearTimeout(detectInterval); detectInterval = null }
+      if(stream){
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.pause();
+      video.srcObject = null;
+      resultEl.textContent = '- ningún código detectado -';
+      log('Cámara detenida');
+    }
+
+    async function toggleTorch(){
+      if(!track){ log('Linterna no disponible'); return }
+      const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+      if(!capabilities.torch){ log('El dispositivo no soporta linterna via API'); return }
+      try{
+        useTorch = !useTorch;
+        await track.applyConstraints({ advanced: [{ torch: useTorch }] });
+        torchBtn.textContent = useTorch ? 'Apagar linterna' : 'Encender linterna';
+        log('Linterna ' + (useTorch ? 'activada' : 'desactivada'));
+      }catch(err){
+        log('Error al alternar linterna: ' + err.message);
+      }
+    }
+
+    function drawLine(begin, end, color){
+      ctx.beginPath();
+      ctx.moveTo(begin.x, begin.y);
+      ctx.lineTo(end.x, end.y);
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = color;
+      ctx.stroke();
+    }
+
+    async function detectLoop(){
+      if(!scanning) return;
+      if(video.readyState !== HTMLMediaElement.HAVE_ENOUGH_DATA){
+        detectInterval = setTimeout(detectLoop, 200);
+        return;
+      }
+
+      // size canvas to video each frame in case orientation/size changed
+      if(canvas.width !== video.videoWidth || canvas.height !== video.videoHeight){
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0,0,canvas.width,canvas.height);
+
+      // Prefer BarcodeDetector if available
+      if(window.BarcodeDetector){
+        try{
+          const detector = new BarcodeDetector({formats: ['qr_code']});
+          const detections = await detector.detect(imageData);
+          if(detections && detections.length){
+            const d = detections[0];
+            resultEl.textContent = d.rawValue || JSON.stringify(d);
+            log('QR detectado vía BarcodeDetector');
+          } else {
+            // no detection
+          }
+        }catch(err){
+          // BarcodeDetector may fail on some imageData inputs; fallback below
+        }
+      }
+
+      // Fallback to jsQR
+      const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
+      if(code){
+        // draw location
+        drawLine(code.location.topLeftCorner, code.location.topRightCorner, '#FF3B58');
+        drawLine(code.location.topRightCorner, code.location.bottomRightCorner, '#FF3B58');
+        drawLine(code.location.bottomRightCorner, code.location.bottomLeftCorner, '#FF3B58');
+        drawLine(code.location.bottomLeftCorner, code.location.topLeftCorner, '#FF3B58');
+
+        resultEl.textContent = code.data;
+        log('QR detectado vía jsQR');
+      }
+
+      detectInterval = setTimeout(detectLoop, 200);
+    }
+
+    function log(msg){
+      const ts = new Date().toLocaleTimeString();
+      logEl.textContent = `[${ts}] ${msg}`;
+      console.log(msg);
+    }
+
+    startBtn.addEventListener('click', async ()=>{ await startCamera(); });
+    stopBtn.addEventListener('click', ()=>{ stopCamera(); });
+    torchBtn.addEventListener('click', ()=>{ toggleTorch(); });
+
+    // If the user opens the page on a modern browser, try to start quickly (opt-in)
+    // We avoid autoplay issues by waiting for a user gesture (the start button)
+
+    // quick tip: if the user wants to scan an image file instead of camera
+    // we could add a file input and run jsQR on the selected image.
+  </script>
+</body>
+</html>
